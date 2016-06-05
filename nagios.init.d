@@ -1,5 +1,5 @@
 #!/bin/sh
-# 
+# hola
 # chkconfig: 345 99 01
 # description: Nagios network monitor
 #
