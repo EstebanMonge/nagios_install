@@ -1,0 +1,361 @@
+#!/usr/bin/env python
+
+# check_xiv_hardusage: A Nagios plugin which lets you monitor
+#                      remaining space on an IBM XIV storage
+#                      system.
+
+# Rationale:
+# You may use SNMP to query an XIV storage system for various 
+# usage status numbers, but the SNMP measurement points don't
+# reveal the most crucial of values: Whether at least one pool
+# is approaching its hard limit; detecting this is very important
+# if you work with thin-provisioned pools.
+
+# This Nagios plugin uses the XIV command line interface to
+# query pool usage and capacity. The command line utility is
+# not as light-weight as one might like, so this Nagios plugin
+# may take a while to respond.
+
+# Note that the xcli tool creates a ~nagios/.xiv directory;
+# inside this, there is a GUI10/logs directory (among others).
+# A new, small file is added to the logs-directory every time
+# the xcli utility is run, and hence also every time a Nagios
+# check is run. It seems there is no way to turn this off.
+# You may want to set up a cleaning-task which keeps the
+# number of files low, e.g. using tmpwatch.
+
+# A Nagios configuration may refer to this plugin via a command
+# and service definition like this:
+# define command {
+#    command_name    check_xiv_hardusage
+#    command_line    /usr/local/nagios/check_xiv_hardusage -H $HOSTADDRESS$ -u username -p LKujw3f -w 80 -c 90
+# }
+#
+#define service {
+#        service_description             Pool hard usage
+#        host_name                       xiv1
+#        check_command                   check_xiv_hardusage
+#        use                             generic-service
+#        contacts                        xiv_operations
+#        normal_check_interval           30
+# }
+
+# Author: Troels Arvin <tra@sst.dk>
+# Versioning:
+# $Revision: 15269 $
+# $Date: 2011-02-08 13:27:02 +0100 (Tue, 08 Feb 2011) $
+
+# Updated versions of this Nagios plugin will be made available at
+# http://troels.arvin.dk/code/nagios/check_xiv_hardusage
+
+# Copyright (c) 2011, Danish National Board of Health.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#     * Redistributions of source code must retain the above copyright
+#       notice, this list of conditions and the following disclaimer.
+#     * Redistributions in binary form must reproduce the above copyright
+#       notice, this list of conditions and the following disclaimer in the
+#       documentation and/or other materials provided with the distribution.
+#     * Neither the name of the  the Danish National Board of Health nor the
+#       names of its contributors may be used to endorse or promote products
+#       derived from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY the Danish National Board of Health ''AS IS'' AND ANY
+# EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL the Danish National Board of Health BE LIABLE FOR ANY
+# DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# (Most of the script is wrapped in a big try-block, so that 
+# errors in the script are treated in a way which is interpreted
+# as an UNKNOWN state in Nagios.)
+try:
+    import os
+    import sys
+    import subprocess
+    import getopt
+    import csv
+
+    this_script = os.path.basename(__file__)
+
+    # Defaults
+    hostname           = 'xiv'
+    username           = 'nagios'
+    password           = 'nagios'
+    thres_w            = 85
+    thres_c            = 95
+    consider_all_pools = False
+    do_debug           = False
+
+    # Helper functions
+    def debug(msg):
+        if do_debug:
+            print "debug: %s" % msg
+
+    def usage():
+        print (
+            """Usage:
+  %s [ -H <hostname> ] [ -u <username> ] [ -p <password> ] 
+        [ -w <warning threshold pct> ] [ -c <critical threshold pct> ]
+        [ -a ] [ -d ]
+
+hostname may be a hostname or an IP address.
+
+-a: consider all storage pools for alarming, even those 
+    without thin provisioning
+
+-d: turn on debugging
+
+Defaults:
+    hostname              : %s
+    username              : %s
+    password:             : %s
+    warning  threshold pct: %d
+    critical threshold pct: %d
+
+Communicates with the XIV storage system, and for each storage pool the
+current used-value is compared with the hard size. If used/hard rised
+above indicated percentages, a non-OK status is returned.
+By default, only pools with thin provisioning are considered for
+alarms.
+
+Example usage:
+  %s -H xiv1 -u someuser -p passw0rd -w 80 -c 90
+
+The XIV user being used should be a Read Only account on the XIV system.
+The XIV client utilities take a long time to start up, and aren't exactly
+light-weight. Thus, such Nagios checks should be run too often.""" %
+            (
+                this_script,
+                hostname,
+                username,
+                password,
+                thres_w,
+                thres_c,
+                this_script
+            )
+        )
+        sys.exit(3)
+
+    # Args handling and sanity checks
+    try:
+        options, args = getopt.getopt(sys.argv[1:], "H:adu:p:w:c:h", ['help'])
+    except getopt.GetoptError:
+        usage()
+
+    for name, value in options:
+        if name=='-H':
+            hostname = value
+        elif name=='-d':
+            do_debug = True
+        elif name=='-a':
+            consider_all_pools = True
+        elif name=='-u':
+            username = value
+        elif name=='-p':
+            password = value
+        elif name=='-c':
+            try:
+                thres_c = int(value)
+            except Exception:
+                print "Unable to convert CRITICAL threshold to integer\n"
+                usage()
+        elif name=='-w':
+            try:
+                thres_w = int(value)
+            except Exception:
+                print "Unable to convert WARNING threshold to integer\n"
+                usage()
+        else:
+            usage()
+
+    if thres_w >= thres_c:
+        print "WARNING-threshold (%d) greater than CRITICAL-threshold (%d)" % (
+            thres_w,
+            thres_c
+        )
+        sys.exit(3)
+
+    if thres_w < 0 or thres_w > 100 or thres_c < 0 or thres_c > 100:
+        print 'Thresholds need to be between 0 and 100'
+        sys.exit(3)
+
+    debug("Thresholds: warn=%d; crit=%d" % (thres_w, thres_c))
+
+    # The XIV command line utilities don't live in a common place,
+    # so we look for the xcli utility in the path, and other
+    # places.
+    xcli_path = None
+    special_dirs = ['/usr/local/XIVGUI','/opt/XIVGUI','/opt/ibm/XIVGUI']
+
+    # Add the special directories to the general path, and go searching
+    # for the xcli command line utility
+    dlist = os.environ['PATH'].split(':') + special_dirs
+    for d in dlist:
+        fullpath = os.path.join(d,'xcli')
+        if os.path.exists(fullpath):
+            xcli_path = fullpath
+            break
+
+    if xcli_path is None:
+        print('xcli not found')
+        sys.exit(3)
+
+
+    # Ready to work
+
+    # Call out to xcli
+    cmd = [
+        'xcli',
+        '-u', username,
+        '-p', password,
+        '-m', hostname,
+        '-t', 'name,soft_size,hard_size,used_by_volumes',   # which columns to pull
+        '-s',                                               # CSV output, please
+        'pool_list'                                         # xcli command
+    ]
+    p = subprocess.Popen(cmd, executable=xcli_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    output = p.communicate()[0]
+    debug("Output: %s" % output)
+    retval = p.returncode
+    if retval <> 0:
+        print "xcli command failed with return code %d and message '%s'" % (
+            retval,
+            output.replace('\n',' ')
+        )
+        sys.exit(3)
+
+    lines = output.split('\n')
+
+    # The xcli utility may emit annoying (but benign) Java warnings that we want
+    # to skip, and we don't want the header-line.
+    cut_point = None
+    i = 0
+    for line in lines:
+        if (line.find('"Name","Size (GB)","Hard Size (GB)"') >= 0):
+            cut_point = i+1
+            break
+        i += 1
+    if cut_point is None:
+        print "Could not find header line in output from xcli"
+        sys.exit(3)
+    lines = lines[cut_point:]
+
+    # Build structures from the CSV returned by xcli
+    pools = []
+    softs = []
+    hards = []
+    useds = []
+    pcts  = []
+    try:
+        reader = csv.reader(lines)
+        for r in reader:
+
+            # output may contain empty lines
+            if len(r) == 4:
+                pools.append(r[0])
+                softs.append(float(r[1]))
+                hards.append(float(r[2]))
+                useds.append(float(r[3]))
+    except:
+        print "Could not parse output from xcli"
+        sys.exit(3)
+
+    # Calculate percentages
+    i = 0
+    highest_pct = 0
+    crits = []
+    warns = []
+    for pool in pools:
+        used = useds[i]
+        soft = softs[i]
+        hard = hards[i]
+        pct = int(round((used / hard) * 100))
+        # Conditinal evaluation, based on whether to consider
+        # hard-provisioned pools, or not
+        if consider_all_pools or (soft < hard):
+            if pct > highest_pct:
+                highest_pct = pct
+            if (pct >= thres_w and pct < thres_c):
+                warns.append(pool)
+            if (pct >= thres_c):
+                crits.append(pool)
+        pcts.append(pct)
+        debug(
+            "pool=%s; soft=%d, hard=%d, used=%d; pct=%d" % (
+                pool,
+                soft,
+                hard,
+                used,
+                pct
+            )
+        )
+        i += 1
+
+    # Prepare Nagios exit code and status string
+    nagios_ret = 0
+    nagios_str = 'XIV capacity OK: No pool hard usage above thresholds'
+    if (highest_pct >= thres_w and highest_pct < thres_c):
+        nagios_ret = 1
+        nagios_str = 'XIV capacity WARNING: At least one pool (%s) has hard usage pct >= %d' % (
+            ','.join(warns),
+            thres_w
+        )
+    if (highest_pct >= thres_c):
+        nagios_ret = 2
+        nagios_str = 'XIV capacity CRITICAL: At least one pool (%s) has hard usage pct >= %d' % (
+            ','.join(crits),
+            thres_c
+        )
+
+    # Prepare performance data string
+    perf_str_elems = []
+    i = 0
+    # Performance data labels should be unique within the first
+    # 19 characters, so choose naming in order to try to
+    # fulfill this.
+    for pool in pools:
+        perf_str_elems.append(
+            "'%s rel hard usage'=%d%%;%d;%d" % (
+                pool,
+                pcts[i],
+                thres_w,
+                thres_c
+            )
+        )
+        perf_str_elems.append(
+            "'%s abs hard usage'=%dGB" % (
+                pool,
+                hards[i]
+            )
+        )
+        i += 1
+
+    # Final output
+    print "%s| %s" % (
+        nagios_str,
+        ' '.join(perf_str_elems)
+    )
+    sys.exit(nagios_ret)
+
+# ==========================================================
+# Error and exit handling
+# ==========================================================
+except SystemExit, e:
+    # Special case which is needed in order to convert the return code
+    # from other exception handlers.
+    sys.exit(int(str(e)))
+except:
+    # At this point, we don't know what's going on, so let's
+    # not output the details of the error into something which
+    # would appear in the Nagios web interface.
+    print "UNKNOWN - An unhandled error occurred. "
+    sys.stderr.write('Unhandled error: %s' % sys.exc_info()[1])
+    sys.exit(3)
